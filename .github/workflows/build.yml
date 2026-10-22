@@ -1,0 +1,173 @@
+name: Build PHP images
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  schedule:
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      matrix: ${{ steps.changes.outputs.matrix }}
+      changed: ${{ steps.changes.outputs.changed }}
+    steps:
+      - uses: docker/setup-buildx-action@v4.4.1
+      - uses: docker/login-action@v4.6.0
+        if: github.event_name == 'schedule'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Select images to build
+        id: changes
+        shell: python
+        run: |
+          import json
+          import os
+          import subprocess
+
+          def inspect(image, field):
+              result = subprocess.run(
+                  ["docker", "buildx", "imagetools", "inspect", image,
+                   "--format", "{{json ." + field + "}}"],
+                  capture_output=True, text=True,
+              )
+              if result.returncode:
+                  # A missing published image needs its first build; other errors fail the check.
+                  if field == "Image" and any(message in result.stderr.lower()
+                                             for message in ("not found", "manifest unknown")):
+                      return {}
+                  raise RuntimeError(result.stderr)
+              return json.loads(result.stdout)
+
+          images = []
+          for image, suffix in (("cli", "cli"), ("web", "fpm-nginx")):
+              for php in ("8.4", "8.5"):
+                  upstream = f"serversideup/php:{php}-{suffix}"
+                  manifest = inspect(upstream, "Manifest")
+                  digest = manifest["digest"]
+                  if "manifests" in manifest:
+                      digest = next(item["digest"] for item in manifest["manifests"]
+                                    if item.get("platform", {}).get("os") == "linux"
+                                    and item.get("platform", {}).get("architecture") == "amd64")
+                  if os.environ["GITHUB_EVENT_NAME"] == "schedule":
+                      published = inspect(f"ghcr.io/empinet/php-{image}:{php}", "Image")
+                      config = published.get("linux/amd64", published)
+                      previous = (config.get("config", {}).get("Labels") or {}).get("io.empinet.upstream.digest")
+                      if previous == digest:
+                          print(f"Skipping php-{image}:{php}: upstream unchanged")
+                          continue
+                  images.append({"image": image, "php": php, "digest": digest})
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("matrix=" + json.dumps({"include": images}) + "\n")
+              output.write("changed=" + str(bool(images)).lower() + "\n")
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      IMAGE: ghcr.io/empinet/php-${{ matrix.image }}
+      BUILD_TAG: ${{ matrix.php }}-build-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4.4.1
+      - uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          file: php/${{ matrix.image }}/Dockerfile
+          build-args: |
+            PHP_VERSION=${{ matrix.php }}
+            PHP_DIGEST=@${{ matrix.digest }}
+          labels: io.empinet.upstream.digest=${{ matrix.digest }}
+          platforms: linux/amd64
+          pull: true
+          load: true
+          tags: |
+            ${{ env.IMAGE }}:${{ matrix.php }}
+            ${{ env.IMAGE }}:${{ env.BUILD_TAG }}
+          cache-from: type=gha,scope=php-${{ matrix.image }}-${{ matrix.php }}
+          cache-to: type=gha,mode=max,scope=php-${{ matrix.image }}-${{ matrix.php }}
+      - name: Verify PHP and runtime user
+        env:
+          PHP_VERSION: ${{ matrix.php }}
+        run: |
+          docker run --rm --entrypoint sh "$IMAGE:$BUILD_TAG" -ec '
+            test "$(id -u)" = 33
+            test "$(id -g)" = 33
+            test "$(id -un)" = www-data
+          '
+          docker run --rm --entrypoint php "$IMAGE:$BUILD_TAG" -r '
+            if (PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION !== $argv[1]) {
+                fwrite(STDERR, "Unexpected PHP version: " . PHP_VERSION . "\n");
+                exit(1);
+            }
+            $required = explode(" ", "bcmath ctype curl dom exif fileinfo gd iconv imagick intl json mbstring mysqli openssl pcntl PDO pdo_mysql pdo_pgsql pdo_sqlite posix readline redis SimpleXML sodium sqlite3 tokenizer xml xmlreader xmlwriter zip zlib");
+            $required[] = "Zend OPcache";
+            foreach ($required as $extension) {
+                if (!extension_loaded($extension)) {
+                    fwrite(STDERR, "Missing extension: $extension\n");
+                    exit(1);
+                }
+            }
+            echo "PHP " . PHP_VERSION . ": required extensions loaded\n";
+          ' "$PHP_VERSION"
+      - name: Save verified image
+        if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        run: |
+          docker save "$IMAGE:${{ matrix.php }}" "$IMAGE:$BUILD_TAG" | gzip > image.tar.gz
+          echo "BUILD_TAG=$BUILD_TAG" > image.env
+      - uses: actions/upload-artifact@v7.0.2
+        if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        with:
+          name: php-${{ matrix.image }}-${{ matrix.php }}
+          path: |
+            image.tar.gz
+            image.env
+          overwrite: true
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    needs: [plan, build]
+    if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      IMAGE: ghcr.io/empinet/php-${{ matrix.image }}
+    steps:
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: php-${{ matrix.image }}-${{ matrix.php }}
+      - name: Load verified image
+        run: |
+          docker load --input image.tar.gz
+          cat image.env >> "$GITHUB_ENV"
+      - uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish verified image
+        run: |
+          docker push "$IMAGE:$BUILD_TAG"
+          docker push "$IMAGE:${{ matrix.php }}"
