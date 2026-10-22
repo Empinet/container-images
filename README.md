@@ -6,6 +6,7 @@ PHP images based on [ServerSideUp](https://serversideup.net/open-source/docker-p
 | --- | --- | --- |
 | `ghcr.io/empinet/php-cli` | `8.4`, `8.5` | `serversideup/php:<version>-cli` |
 | `ghcr.io/empinet/php-web` | `8.4`, `8.5` | `serversideup/php:<version>-fpm-nginx` |
+| `ghcr.io/empinet/php-franken` | `8.4`, `8.5` | `serversideup/php:<version>-frankenphp-trixie` |
 
 Each published build also has a `<version>-build-<run-id>-<attempt>` tag.
 

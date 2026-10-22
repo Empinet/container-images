@@ -51,7 +51,7 @@ jobs:
               return json.loads(result.stdout)
 
           images = []
-          for image, suffix in (("cli", "cli"), ("web", "fpm-nginx")):
+          for image, suffix in (("cli", "cli"), ("web", "fpm-nginx"), ("franken", "frankenphp-trixie")):
               for php in ("8.4", "8.5"):
                   upstream = f"serversideup/php:{php}-{suffix}"
                   manifest = inspect(upstream, "Manifest")
@@ -112,13 +112,23 @@ jobs:
             test "$(id -g)" = 33
             test "$(id -un)" = www-data
           '
-          docker run --rm --entrypoint php "$IMAGE:$BUILD_TAG" -r '
+          PHP_TEST=$(cat <<'PHP'
             if (PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION !== $argv[1]) {
                 fwrite(STDERR, "Unexpected PHP version: " . PHP_VERSION . "\n");
                 exit(1);
             }
-            $required = explode(" ", "bcmath ctype curl dom exif fileinfo gd iconv imagick intl json mbstring mysqli openssl pcntl PDO pdo_mysql pdo_pgsql pdo_sqlite posix readline redis SimpleXML sodium sqlite3 tokenizer xml xmlreader xmlwriter zip zlib");
+            $required = explode(" ", "Core PDO Phar Reflection SPL SimpleXML bcmath ctype curl date dom exif fileinfo filter gd hash iconv imagick intl json libxml mbstring mysqli mysqlnd openssl pcntl pcre pdo_mysql pdo_pgsql pdo_sqlite posix random readline redis session sodium sqlite3 standard tokenizer xml xmlreader xmlwriter zip zlib");
             $required[] = "Zend OPcache";
+            if ($argv[2] === "franken") {
+                $required = array_diff($required, ["imagick", "mysqli"]);
+                if (!PHP_ZTS) {
+                    fwrite(STDERR, "FrankenPHP requires thread-safe PHP\n");
+                    exit(1);
+                }
+            }
+            if (PHP_VERSION_ID >= 80500) {
+                $required = array_merge($required, ["lexbor", "uri"]);
+            }
             foreach ($required as $extension) {
                 if (!extension_loaded($extension)) {
                     fwrite(STDERR, "Missing extension: $extension\n");
@@ -126,7 +136,37 @@ jobs:
                 }
             }
             echo "PHP " . PHP_VERSION . ": required extensions loaded\n";
-          ' "$PHP_VERSION"
+          PHP
+          )
+          docker run --rm --entrypoint php "$IMAGE:$BUILD_TAG" -r "$PHP_TEST" "$PHP_VERSION" "${{ matrix.image }}"
+          if [ "${{ matrix.image }}" = franken ]; then
+            docker run --rm --entrypoint frankenphp "$IMAGE:$BUILD_TAG" php-cli -r "$PHP_TEST" "$PHP_VERSION" franken
+          fi
+      - name: Verify FrankenPHP dependencies and HTTP health
+        if: matrix.image == 'franken'
+        run: |
+          docker run --rm --entrypoint sh "$IMAGE:$BUILD_TAG" -ec '
+            composer --version --no-ansi
+            frankenphp version
+            dpkg-query -W libmbedcrypto16 libmbedtls21 libmbedx509-7
+            for binary in php php-cgi phpdbg phpize php-config frankenphp curl openssl zip unzip ps pgrep pkill; do
+              command -v "$binary"
+            done
+            for binary in /usr/local/bin/php /usr/local/bin/frankenphp /usr/local/lib/libphp.so; do
+              ldd "$binary" > /tmp/libraries
+              cat /tmp/libraries
+              if grep -q "not found" /tmp/libraries; then exit 1; fi
+            done
+          '
+          container=$(docker run --detach "$IMAGE:$BUILD_TAG")
+          trap 'docker logs "$container"; docker rm --force "$container"' EXIT
+          for attempt in $(seq 1 30); do
+            if docker exec "$container" curl --fail --silent http://localhost:8080/healthcheck; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
       - name: Save verified image
         if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
         run: |
